@@ -6,9 +6,9 @@ import { createPlugin } from '@/utils';
 import { waitForElement } from '@/utils/wait-for-element';
 
 import { Connection, type ConnectionEventUnion } from './connection';
+import { DriftCorrector } from './drift';
 import { PlaybackHold } from './hold';
 import { Queue } from './queue';
-import { hashVideoIds } from './queue/utils';
 import style from './style.css?inline';
 import settingHTML from './templates/setting.html?raw';
 import {
@@ -57,6 +57,13 @@ const GUEST_HOLD_TIMEOUT = 12_000;
 // Min time (ms) between song switches caused by periodic syncs, so a song
 // that is still loading isn't restarted over and over
 const INDEX_SYNC_COOLDOWN = 5_000;
+// Once the host and at least one guest are ready, how long (ms) the host still
+// waits for the others before starting anyway
+const STRAGGLER_GRACE = 3_000;
+// Min time (ms) between progress reports caused by dragging the slider
+const SLIDER_THROTTLE = 300;
+// While paused nothing moves, so progress only goes out every N-th second
+const PAUSED_PROGRESS_EVERY = 3;
 
 const PLAYER_ENDED = 0;
 
@@ -91,6 +98,13 @@ export default createPlugin<
     queue?: Queue;
     playerApi?: MusicPlayer;
     hold: PlaybackHold;
+    drift: DriftCorrector;
+    // extra ICE (STUN/TURN) servers from the plugin config
+    iceServers: RTCIceServer[];
+    // what the host last sent as a full queue, to skip identical resends
+    lastQueueSignature?: string;
+    progressTicks: number;
+    sendProgress: () => void;
     showPrompt: (title: string, label: string) => Promise<string>;
     popups: {
       host: ReturnType<typeof createHostPopup>;
@@ -108,7 +122,10 @@ export default createPlugin<
     lastHostState?: number;
     rollbackInjector?: () => void;
     me?: Omit<Profile, 'id'>;
+    // users in the session
     profiles: Record<string, Profile>;
+    // everyone seen this session, so songs of users who left keep their owner
+    knownProfiles: Record<string, Profile>;
     permission: Permission;
     videoChangeListener: (
       event: CustomEvent<VideoDataChanged>,
@@ -156,7 +173,11 @@ export default createPlugin<
       spinner: HTMLElement;
     },
     profiles: {},
+    knownProfiles: {},
     hold: new PlaybackHold(),
+    drift: new DriftCorrector(),
+    iceServers: [],
+    progressTicks: 0,
     showPrompt: () => Promise.resolve(''),
     api: null,
 
@@ -171,18 +192,50 @@ export default createPlugin<
 
           this.queue?.setVideoList(videoList, false);
           this.queue?.syncQueueOwner();
-          await this.connection.broadcast('SYNC_QUEUE', {
-            videoList,
-          });
+
+          // guests only need the queue if it differs from what they have
+          const signature = videoList
+            .map((it) => `${it.videoId}:${it.ownerId}`)
+            .join(',');
+          if (signature !== this.lastQueueSignature) {
+            this.lastQueueSignature = signature;
+            await this.connection.broadcast('SYNC_QUEUE', {
+              videoList,
+            });
+          }
 
           this.updateNext = event.detail.name === 'dataloaded';
         }
       }
     },
 
+    sendProgress() {
+      if (this.connection?.mode !== 'host') return;
+      if (this.connection.getConnections().length === 0) return;
+      // mid song change, the queue position isn't meaningful yet
+      if (this.hold.active) return;
+
+      this.connection
+        .broadcast('SYNC_PROGRESS', {
+          progress: this.playerApi?.getCurrentTime(),
+          state: this.playerApi?.getPlayerState(),
+          index: this.queue?.selectedIndex ?? 0,
+          videoId: this.playerApi?.getVideoData()?.video_id,
+          queueHash: this.queue?.queueHash,
+        })
+        .catch(logError);
+    },
+
     async videoStateChangeListener() {
       // pause right away if a song starts while waiting for everyone
       this.hold.tick();
+
+      if (this.connection?.mode === 'host') {
+        // tell guests about play, pause and seeks now, not on the next tick
+        const state = this.playerApi?.getPlayerState();
+        if (state === 1 || state === 2) this.sendProgress();
+        return;
+      }
 
       if (this.connection?.mode !== 'guest') return;
       if (this.hold.active) return;
@@ -200,13 +253,15 @@ export default createPlugin<
 
     /* connection */
     async onHost() {
-      this.connection = new Connection();
+      this.connection = new Connection(this.iceServers);
       const wait = await this.connection.waitForReady().catch(() => null);
       if (!wait) return false;
 
       if (!this.me) this.me = getDefaultProfile(this.connection.id);
 
+      this.lastQueueSignature = undefined;
       this.profiles = {};
+      this.knownProfiles = {};
       this.putProfile(this.connection.id, {
         id: this.connection.id,
         ...this.me,
@@ -226,6 +281,7 @@ export default createPlugin<
         ) ?? [];
       this.queue?.setVideoList(rawItems, false);
       this.queue?.syncQueueOwner();
+      this.queue?.watchQueueOwner();
       this.queue?.initQueue();
       this.queue?.injection();
 
@@ -239,7 +295,9 @@ export default createPlugin<
         id: string;
         videoId: string;
         pending: Set<string>;
+        total: number;
         hostReady: boolean;
+        graceTimer?: number;
       };
       let transition: Transition | undefined;
 
@@ -252,6 +310,7 @@ export default createPlugin<
       const finishTransition = async () => {
         const finished = transition;
         transition = undefined;
+        clearTimeout(finished?.graceTimer);
         // guests may be waiting even if the change never got a target song
         await this.connection?.broadcast('TRANSITION_GO', {
           transitionId: finished?.id,
@@ -270,9 +329,18 @@ export default createPlugin<
       };
 
       const checkTransition = (current: Transition) => {
-        if (transition !== current) return;
-        if (current.hostReady && current.pending.size === 0) {
+        if (transition !== current || !current.hostReady) return;
+
+        if (current.pending.size === 0) {
           finishTransition().catch(logError);
+        } else if (
+          current.pending.size < current.total &&
+          current.graceTimer === undefined
+        ) {
+          // someone is ready, don't let a slow guest hold everybody back
+          current.graceTimer = window.setTimeout(() => {
+            if (transition === current) finishTransition().catch(logError);
+          }, STRAGGLER_GRACE);
         }
       };
 
@@ -320,6 +388,7 @@ export default createPlugin<
           id: createTransitionId(),
           videoId: targetId,
           pending: new Set(peers),
+          total: peers.length,
           hostReady: false,
         };
         transition = current;
@@ -355,6 +424,10 @@ export default createPlugin<
             checkTransition(transition);
           }
 
+          // the guest already came back on a new connection, the old one only
+          // now noticed it was lost
+          if (guestPeers().includes(connection.peer)) return;
+
           this.api?.toastService?.show(
             t('plugins.music-together.toast.user-disconnected', {
               name: this.profiles[connection.peer]?.name,
@@ -368,13 +441,11 @@ export default createPlugin<
         event: ConnectionEventUnion,
         conn?: DataConnection | null,
       ) => {
-        this.ignoreChange = true;
-
         switch (event.type) {
           case 'CLEAR_QUEUE': {
             if (conn && this.permission === 'host-only') {
               await this.connection?.broadcast('SYNC_QUEUE', {
-                videoList: this.queue?.videoList ?? [],
+                videoList: this.queue?.getSnapshot() ?? [],
               });
               return;
             }
@@ -399,7 +470,7 @@ export default createPlugin<
           case 'ADD_SONGS': {
             if (conn && this.permission === 'host-only') {
               await this.connection?.broadcast('SYNC_QUEUE', {
-                videoList: this.queue?.videoList ?? [],
+                videoList: this.queue?.getSnapshot() ?? [],
               });
               return;
             }
@@ -419,11 +490,24 @@ export default createPlugin<
               event.after = undefined;
             }
 
-            await this.queue?.addVideos(videoList, event.payload.index);
-            await this.connection?.broadcast('ADD_SONGS', {
-              ...event.payload,
-              videoList,
-            });
+            // guests fetch the songs while we do, instead of after we're done
+            const [added] = await Promise.all([
+              this.queue?.addVideos(
+                videoList,
+                event.payload.index,
+                event.payload.replace,
+              ),
+              this.connection?.broadcast('ADD_SONGS', {
+                ...event.payload,
+                videoList,
+              }),
+            ]);
+            // guests were told about songs we couldn't add, set them straight
+            if (added === false) {
+              await this.connection?.broadcast('SYNC_QUEUE', {
+                videoList: this.queue?.getSnapshot() ?? [],
+              });
+            }
 
             if (playsSong) {
               await changeSong(
@@ -437,7 +521,7 @@ export default createPlugin<
           case 'REMOVE_SONG': {
             if (conn && this.permission === 'host-only') {
               await this.connection?.broadcast('SYNC_QUEUE', {
-                videoList: this.queue?.videoList ?? [],
+                videoList: this.queue?.getSnapshot() ?? [],
               });
               return;
             }
@@ -449,9 +533,9 @@ export default createPlugin<
           case 'MOVE_SONG': {
             if (conn && this.permission === 'host-only') {
               await this.connection?.broadcast('SYNC_QUEUE', {
-                videoList: this.queue?.videoList ?? [],
+                videoList: this.queue?.getSnapshot() ?? [],
               });
-              break;
+              return;
             }
 
             this.queue?.moveItem(
@@ -495,6 +579,9 @@ export default createPlugin<
             const videoList = this.queue?.getSnapshot() ?? [];
             this.queue?.setVideoList(videoList, false);
             await this.connection?.broadcast('SYNC_QUEUE', { videoList });
+            this.lastQueueSignature = videoList
+              .map((it) => `${it.videoId}:${it.ownerId}`)
+              .join(',');
             break;
           }
           case 'SYNC_PROGRESS': {
@@ -557,18 +644,16 @@ export default createPlugin<
       this.connection.on((event, conn) => run(() => listener(event, conn)));
       this.queue?.on(queueListener);
 
-      setTimeout(() => {
-        this.ignoreChange = false;
-      }, 16); // wait 1 frame
       return true;
     },
 
     async onJoin() {
-      this.connection = new Connection();
+      this.connection = new Connection(this.iceServers);
       const wait = await this.connection.waitForReady().catch(() => null);
       if (!wait) return false;
 
       this.profiles = {};
+      this.knownProfiles = {};
 
       const id = await this.showPrompt(
         t('plugins.music-together.name'),
@@ -585,6 +670,23 @@ export default createPlugin<
           );
           this.onStop();
         }
+      });
+      this.connection.onRejoin((state) => {
+        if (state === 'rejoining') {
+          this.api?.toastService?.show(
+            t('plugins.music-together.toast.reconnecting'),
+          );
+          return;
+        }
+
+        this.api?.toastService?.show(
+          t('plugins.music-together.toast.reconnected'),
+        );
+        // whatever the host was doing, we missed it
+        transition = undefined;
+        this.hold.release(false);
+        this.drift.reset();
+        handshake().catch(logError);
       });
 
       let resolveIgnore: number | null = null;
@@ -606,6 +708,7 @@ export default createPlugin<
 
       /** Stay paused until the host says everyone is ready. */
       const holdForHost = () => {
+        this.drift.reset();
         this.hold.start(GUEST_HOLD_TIMEOUT, () => {
           console.warn('Music Together: host never started the song, playing');
           transition = undefined;
@@ -750,6 +853,7 @@ export default createPlugin<
             transition = undefined;
             if (!this.hold.active) break;
             this.hold.release(false);
+            this.drift.reset();
 
             // start where the host is, accounting for the time it took to get here
             const delayMs =
@@ -773,7 +877,11 @@ export default createPlugin<
               }),
             );
 
-            await this.queue?.addVideos(videoList, event.payload.index);
+            await this.queue?.addVideos(
+              videoList,
+              event.payload.index,
+              event.payload.replace,
+            );
 
             const afterevent = event.after?.at(0);
             if (afterevent?.type === 'SET_INDEX') {
@@ -828,7 +936,7 @@ export default createPlugin<
 
             // Self-heal: if our queue differs from the host's, ask for a full copy
             if (typeof payload.queueHash === 'string' && this.queue) {
-              if (hashVideoIds(this.queue.videoIds) === payload.queueHash) {
+              if (this.queue.queueHash === payload.queueHash) {
                 hashMismatches = 0;
                 resyncBackoff = RESYNC_BACKOFF_MIN;
               } else if (
@@ -896,14 +1004,23 @@ export default createPlugin<
               }
 
               const currentTime = this.playerApi?.getCurrentTime() ?? 0;
+              const drift = target - currentTime;
               const now = performance.now();
               if (
-                Math.abs(target - currentTime) > DRIFT_THRESHOLD &&
+                Math.abs(drift) > DRIFT_THRESHOLD &&
                 now - lastSeekAt > SEEK_COOLDOWN
               ) {
                 lastSeekAt = now;
+                this.drift.reset();
                 this.playerApi?.seekTo(target);
+              } else if (payload.state === 1) {
+                // small drift: play a little faster or slower instead of seeking
+                this.drift.update(drift);
+              } else {
+                this.drift.reset();
               }
+            } else {
+              this.drift.reset();
             }
             break;
           }
@@ -968,6 +1085,27 @@ export default createPlugin<
         ...this.me,
       });
 
+      /** Introduces us to the host and asks for everything we need to follow. */
+      const handshake = async () => {
+        const connection = this.connection;
+        const me = this.me;
+        if (!connection || !me) return;
+
+        await Promise.all([
+          connection.broadcast('IDENTIFY', {
+            profile: {
+              id: connection.id,
+              handleId: me.handleId,
+              name: me.name,
+              thumbnail: me.thumbnail,
+            },
+          }),
+          connection.broadcast('SYNC_PROFILE', undefined),
+          connection.broadcast('PERMISSION', undefined),
+          connection.broadcast('SYNC_QUEUE', undefined),
+        ]);
+      };
+
       const progress = Array.from(
         document.querySelectorAll<
           HTMLElement & {
@@ -975,6 +1113,26 @@ export default createPlugin<
           }
         >('tp-yt-paper-progress'),
       );
+      // Dragging the slider updates it many times a second; report the first
+      // position right away, then at most every SLIDER_THROTTLE ms, ending on
+      // the last position
+      let lastSliderSentAt = 0;
+      let sliderTimer: number | undefined;
+      let sliderProgress: number | undefined;
+      const sendSliderProgress = () => {
+        sliderTimer = undefined;
+        if (sliderProgress === undefined) return;
+        const progress = sliderProgress;
+        sliderProgress = undefined;
+        lastSliderSentAt = performance.now();
+        this.connection
+          ?.broadcast('SYNC_PROGRESS', {
+            progress,
+            state: this.playerApi?.getPlayerState(),
+          })
+          .catch(logError);
+      };
+
       const rollbackList = progress.map((progress) => {
         const original = progress._update;
         progress._update = (...args) => {
@@ -986,11 +1144,14 @@ export default createPlugin<
             typeof now === 'number'
           ) {
             const currentTime = this.playerApi?.getCurrentTime() ?? 0;
-            if (Math.abs(now - currentTime) > 3)
-              this.connection?.broadcast('SYNC_PROGRESS', {
-                progress: now,
-                state: this.playerApi?.getPlayerState(),
-              });
+            if (Math.abs(now - currentTime) > 3) {
+              sliderProgress = now;
+              const wait =
+                SLIDER_THROTTLE - (performance.now() - lastSliderSentAt);
+              if (wait <= 0) sendSliderProgress();
+              else if (sliderTimer === undefined)
+                sliderTimer = window.setTimeout(sendSliderProgress, wait);
+            }
           }
 
           original.call(progress, ...args);
@@ -1002,25 +1163,21 @@ export default createPlugin<
       });
       this.rollbackInjector = () => {
         rollbackList.forEach((rollback) => rollback());
+        clearTimeout(sliderTimer);
+        sliderTimer = undefined;
       };
 
-      await this.connection.broadcast('IDENTIFY', {
-        profile: {
-          id: this.connection.id,
-          handleId: this.me.handleId,
-          name: this.me.name,
-          thumbnail: this.me.thumbnail,
-        },
-      });
-
-      await this.connection.broadcast('SYNC_PROFILE', undefined);
-      await this.connection.broadcast('PERMISSION', undefined);
+      // whatever was playing before joining must not keep going out loud
+      // until the host's first progress update says what to play
+      this.playerApi?.pauseVideo();
 
       this.queue?.clear();
       this.queue?.syncQueueOwner();
+      this.queue?.watchQueueOwner();
       this.queue?.initQueue();
 
-      await this.connection.broadcast('SYNC_QUEUE', undefined);
+      // messages arrive in the order they were sent, so one go is enough
+      await handshake();
 
       return true;
     },
@@ -1028,6 +1185,7 @@ export default createPlugin<
     onStop() {
       // don't leave the player paused mid song change
       this.hold.release(true);
+      this.drift.reset();
       if (this.connection?.mode !== 'disconnected') {
         this.connection?.disconnect();
       }
@@ -1039,6 +1197,7 @@ export default createPlugin<
       }
 
       this.profiles = {};
+      this.knownProfiles = {};
       this.popups.host.setUsers(Object.values(this.profiles));
       this.popups.guest.setUsers(Object.values(this.profiles));
 
@@ -1053,10 +1212,13 @@ export default createPlugin<
         delete this.profiles[id];
       } else {
         this.profiles[id] = profile;
+        this.knownProfiles[id] = profile;
       }
 
       this.popups.host.setUsers(Object.values(this.profiles));
       this.popups.guest.setUsers(Object.values(this.profiles));
+      // labels may have been waiting for this profile
+      if (profile && this.connection) this.queue?.syncQueueOwner();
     },
 
     showSpinner() {
@@ -1112,8 +1274,18 @@ export default createPlugin<
     },
     /* hooks */
 
-    start({ ipc }) {
+    start({ ipc, getConfig }) {
       this.ipc = ipc;
+
+      // optional extra STUN/TURN servers, e.g. a private TURN server:
+      // "iceServers": [{ "urls": "turn:host:3478", "username": "", "credential": "" }]
+      Promise.resolve(getConfig())
+        .then((config) => {
+          const servers = (config as { iceServers?: unknown }).iceServers;
+          if (Array.isArray(servers))
+            this.iceServers = servers as RTCIceServer[];
+        })
+        .catch(() => undefined); // defaults are fine
       this.showPrompt = (title: string, label: string) =>
         ipc.invoke('music-together:prompt', title, label) as Promise<string>;
       this.api = document.querySelector<AppElement>('ytmusic-app');
@@ -1145,17 +1317,16 @@ export default createPlugin<
 
       this.stateInterval = window.setInterval(() => {
         if (this.connection?.mode !== 'host') return;
-        if (this.connection.getConnections().length === 0) return;
-        // mid song change, the queue position isn't meaningful yet
-        if (this.hold.active) return;
 
-        this.connection.broadcast('SYNC_PROGRESS', {
-          progress: this.playerApi?.getCurrentTime(),
-          state: this.playerApi?.getPlayerState(),
-          index: this.queue?.selectedIndex ?? 0,
-          videoId: this.playerApi?.getVideoData()?.video_id,
-          queueHash: this.queue ? hashVideoIds(this.queue.videoIds) : undefined,
-        });
+        // changes are sent as they happen, so while paused this is a heartbeat
+        this.progressTicks += 1;
+        if (
+          this.playerApi?.getPlayerState() === 2 &&
+          this.progressTicks % PAUSED_PROGRESS_EVERY !== 0
+        )
+          return;
+
+        this.sendProgress();
       }, 1000);
 
       /* UI */
@@ -1298,7 +1469,7 @@ export default createPlugin<
           id: this.connection?.id ?? '',
           ...this.me!,
         },
-        getProfile: (id) => this.profiles[id],
+        getProfile: (id) => this.profiles[id] ?? this.knownProfiles[id],
       });
       this.playerApi = playerApi;
       this.hold.setPlayer(playerApi);

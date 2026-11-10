@@ -28,6 +28,27 @@ export function setupProtocolHandler(win: BrowserWindow) {
   }) as (cmd: string, ...args: string[]) => void;
 }
 
+/**
+ * Finds a music link (e.g. https://music.youtube.com/watch?v=...) among
+ * command line arguments, so it can be opened by the app.
+ */
+export function findMusicUrl(args: string[]): string | undefined {
+  for (const arg of args) {
+    try {
+      const url = new URL(arg);
+      if (
+        url.protocol === 'https:' &&
+        url.hostname === 'music.youtube.com'
+      ) {
+        return url.toString();
+      }
+    } catch {
+      // not a URL
+    }
+  }
+  return undefined;
+}
+
 export function handleProtocol(cmd: string, ...args: string[]) {
   protocolHandler?.(cmd, ...args);
 }

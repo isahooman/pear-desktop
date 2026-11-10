@@ -11,7 +11,8 @@ import type { Permission, Profile, VideoData } from './types';
 
 export type ConnectionEventMap = {
   CLEAR_QUEUE: null;
-  ADD_SONGS: { videoList: VideoData[]; index?: number };
+  // `replace` swaps out the whole queue (someone played a song)
+  ADD_SONGS: { videoList: VideoData[]; index?: number; replace?: boolean };
   REMOVE_SONG: { index: number };
   MOVE_SONG: { fromIndex: number; toIndex: number };
   SET_INDEX: { index: number; videoId?: string; transitionId?: string };
@@ -55,6 +56,7 @@ export type ConnectionListener = (
   conn: DataConnection | null,
 ) => void;
 export type ConnectionMode = 'host' | 'guest' | 'disconnected';
+export type RejoinState = 'rejoining' | 'rejoined';
 
 const RECOVERABLE_PEER_ERRORS = new Set([
   PeerErrorType.Network,
@@ -64,45 +66,61 @@ const RECOVERABLE_PEER_ERRORS = new Set([
 ]);
 
 const PING_INTERVAL = 5_000;
+// Pings are sent more often right after joining, to settle the latency fast
+const FAST_PING_INTERVAL = 2_000;
+const FAST_PING_COUNT = 5;
+// Latency is the best of the last few measurements, spikes aren't real latency
+const LATENCY_SAMPLES = 10;
+// The host drops guests it hasn't heard from (guests ping every few seconds)
+const STALE_AFTER = 20_000;
+const WATCHDOG_INTERVAL = 5_000;
+// How long a guest keeps trying to get back to the host after a drop
+const REJOIN_WINDOW = 20_000;
+const REJOIN_ATTEMPT_TIMEOUT = 5_000;
+
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  {
+    urls: ['turn:eu-0.turn.peerjs.com:3478', 'turn:us-0.turn.peerjs.com:3478'],
+    username: 'peerjs',
+    credential: 'peerjsp',
+  },
+  { urls: 'stun:freestun.net:3478' },
+  { urls: 'turn:freestun.net:3478', username: 'free', credential: 'free' },
+];
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export class Connection {
   private peer: Peer;
   private _mode: ConnectionMode = 'disconnected';
   private connections: Record<string, DataConnection> = {};
+  private lastSeen: Record<string, number> = {};
 
   private isDestroyed = false;
   private isReconnecting = false;
 
-  private pingInterval?: ReturnType<typeof setInterval>;
+  private pingTimer?: ReturnType<typeof setTimeout>;
+  private watchdog?: ReturnType<typeof setInterval>;
+  private rttSamples: number[] = [];
   private _latency = 0;
+
+  // guest only: the connection to the host, and what's needed to restore it
+  private hostId?: string;
+  private hostConn?: DataConnection;
+  private rejoining = false;
+  private rejoinListeners: ((state: RejoinState) => void)[] = [];
 
   private waitOpen: PromiseUtil<string> = {} as PromiseUtil<string>;
   private listeners: ConnectionListener[] = [];
   private connectionListeners: ((connection?: DataConnection) => void)[] = [];
 
-  constructor() {
+  constructor(extraIceServers: RTCIceServer[] = []) {
     this.peer = new Peer({
       debug: 0,
       config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          {
-            urls: [
-              'turn:eu-0.turn.peerjs.com:3478',
-              'turn:us-0.turn.peerjs.com:3478',
-            ],
-            username: 'peerjs',
-            credential: 'peerjsp',
-          },
-          {
-            urls: 'stun:freestun.net:3478',
-          },
-          {
-            urls: 'turn:freestun.net:3478',
-            username: 'free',
-            credential: 'free',
-          },
-        ],
+        iceServers: [...extraIceServers, ...DEFAULT_ICE_SERVERS],
         sdpSemantics: 'unified-plan',
       },
     });
@@ -119,6 +137,7 @@ export class Connection {
 
     this.peer.on('connection', async (conn) => {
       this._mode = 'host';
+      this.startWatchdog();
       try {
         await this.registerConnection(conn);
       } catch {
@@ -180,12 +199,9 @@ export class Connection {
 
     await Promise.race([this.registerConnection(conn), unavailable]);
 
-    const ping = () => {
-      if (!conn.open) return;
-      conn.send({ type: 'PING', payload: { sentAt: performance.now() } });
-    };
-    ping();
-    this.pingInterval = setInterval(ping, PING_INTERVAL);
+    this.hostId = id;
+    this.hostConn = conn;
+    this.startPing();
 
     return conn;
   }
@@ -195,6 +211,7 @@ export class Connection {
 
     this.isDestroyed = true;
     this.isReconnecting = false;
+    this.rejoining = false;
     this._mode = 'disconnected';
 
     this.getConnections().forEach((conn) =>
@@ -221,6 +238,11 @@ export class Connection {
     return this._latency;
   }
 
+  /** Guest only: the connection to the host dropped and is being restored. */
+  public get isRejoining() {
+    return this.rejoining;
+  }
+
   public getConnections() {
     return Object.values(this.connections);
   }
@@ -243,8 +265,13 @@ export class Connection {
     }
   }
 
-  public onConnections(listener: (connections?: DataConnection) => void) {
+  public onConnections(listener: (connection?: DataConnection) => void) {
     this.connectionListeners.push(listener);
+  }
+
+  /** Guest only: called when the host is lost and again once it is back. */
+  public onRejoin(listener: (state: RejoinState) => void) {
+    this.rejoinListeners.push(listener);
   }
 
   /* privates */
@@ -267,17 +294,109 @@ export class Connection {
       } catch (err) {
         console.error('Music Together: reconnect() threw', err);
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, backoff));
+      await sleep(backoff);
     }
 
     this.isReconnecting = false;
   }
 
+  private startPing() {
+    this.stopPing();
+    let sent = 0;
+    const tick = () => {
+      if (this.hostConn?.open) {
+        this.hostConn.send({
+          type: 'PING',
+          payload: { sentAt: performance.now() },
+        });
+      }
+      sent += 1;
+      this.pingTimer = setTimeout(
+        tick,
+        sent < FAST_PING_COUNT ? FAST_PING_INTERVAL : PING_INTERVAL,
+      );
+    };
+    tick();
+  }
+
+  private stopPing() {
+    clearTimeout(this.pingTimer);
+    this.pingTimer = undefined;
+  }
+
+  /** Host only: close connections of guests that went silent. */
+  private startWatchdog() {
+    if (this.watchdog !== undefined) return;
+    this.watchdog = setInterval(() => {
+      const now = performance.now();
+      for (const conn of this.getConnections()) {
+        const seen = this.lastSeen[conn.connectionId] ?? now;
+        if (now - seen > STALE_AFTER) {
+          console.warn('Music Together: dropping silent guest', conn.peer);
+          conn.close();
+        }
+      }
+    }, WATCHDOG_INTERVAL);
+  }
+
+  /** Guest only: tries to get back to the host after the connection dropped. */
+  private async rejoin(lost: DataConnection) {
+    if (this.rejoining || !this.hostId) return;
+    this.rejoining = true;
+    this.stopPing();
+    this.rttSamples = [];
+    this.rejoinListeners.forEach((listener) => listener('rejoining'));
+
+    const deadline = Date.now() + REJOIN_WINDOW;
+    let attempt = 0;
+    while (!this.isDestroyed && Date.now() < deadline) {
+      attempt += 1;
+      // the reconnect loop is bringing the signaling server connection back
+      if (this.peer.disconnected) {
+        await sleep(1_000);
+        continue;
+      }
+
+      const conn = this.peer.connect(this.hostId, { reliable: true });
+      try {
+        await Promise.race([
+          this.registerConnection(conn, false),
+          sleep(REJOIN_ATTEMPT_TIMEOUT).then(() => {
+            throw new Error('rejoin timed out');
+          }),
+        ]);
+        if (this.isDestroyed) return;
+        this.hostConn = conn;
+        this.rejoining = false;
+        this.startPing();
+        this.rejoinListeners.forEach((listener) => listener('rejoined'));
+        return;
+      } catch {
+        // an attempt that never opened must not show up later
+        try {
+          conn.close();
+        } catch {
+          // ignore
+        }
+      }
+      await sleep(Math.min(3_000, 500 * attempt));
+    }
+
+    this.rejoining = false;
+    if (this.isDestroyed) return;
+    this.connectionListeners.forEach((listener) => listener(lost));
+  }
+
   private cleanup() {
     this._mode = 'disconnected';
     this.connections = {};
-    clearInterval(this.pingInterval);
-    this.pingInterval = undefined;
+    this.lastSeen = {};
+    this.hostConn = undefined;
+    this.rejoining = false;
+    this.rttSamples = [];
+    this.stopPing();
+    clearInterval(this.watchdog);
+    this.watchdog = undefined;
 
     for (const listener of this.listeners) {
       listener({ type: 'CONNECTION_CLOSED', payload: null }, null);
@@ -286,16 +405,24 @@ export class Connection {
 
     this.connectionListeners.forEach((listener) => listener());
     this.connectionListeners = [];
+    this.rejoinListeners = [];
   }
 
-  private async registerConnection(conn: DataConnection) {
+  private async registerConnection(conn: DataConnection, notify = true) {
     return new Promise<DataConnection>((resolve, reject) => {
+      let closed = false;
+
       conn.on('open', () => {
         this.connections[conn.connectionId] = conn;
+        this.lastSeen[conn.connectionId] = performance.now();
         resolve(conn);
-        this.connectionListeners.forEach((listener) => listener(conn));
+        if (notify) {
+          this.connectionListeners.forEach((listener) => listener(conn));
+        }
 
         conn.on('data', (data) => {
+          this.lastSeen[conn.connectionId] = performance.now();
+
           if (
             !data ||
             typeof data !== 'object' ||
@@ -315,10 +442,11 @@ export class Connection {
           if (event.type === 'PONG') {
             const rtt = performance.now() - event.payload.sentAt;
             if (rtt >= 0 && rtt < 5_000) {
-              // smooth out jitter
-              this._latency = this._latency
-                ? (this._latency * 0.7) + ((rtt / 2) * 0.3)
-                : rtt / 2;
+              this.rttSamples.push(rtt);
+              if (this.rttSamples.length > LATENCY_SAMPLES) {
+                this.rttSamples.shift();
+              }
+              this._latency = Math.min(...this.rttSamples) / 2;
             }
             return;
           }
@@ -332,11 +460,25 @@ export class Connection {
       const onClose = (
         err?: PeerError<`${DataConnectionErrorType | BaseConnectionErrorType}`>,
       ) => {
+        // an error is followed by a close, handle the connection only once
+        if (closed) return;
+        closed = true;
+
         if (conn.open) {
           conn.close();
         }
 
         delete this.connections[conn.connectionId];
+        delete this.lastSeen[conn.connectionId];
+
+        // the host dropped, try to get back before giving up on the session
+        if (conn === this.hostConn && !this.isDestroyed) {
+          this.hostConn = undefined;
+          this.rejoin(conn).catch(() => undefined);
+          reject(new Error('host connection lost'));
+          return;
+        }
+        if (!notify) return;
 
         if (err) {
           if (err.type === 'connection-closed') {

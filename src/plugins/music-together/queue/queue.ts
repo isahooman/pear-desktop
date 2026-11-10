@@ -1,7 +1,12 @@
 import { t } from '@/i18n';
 
 import { getMusicQueueRenderer } from './song';
-import { mapQueueItem } from './utils';
+import {
+  alignOwners,
+  getItemVideoIds,
+  hashVideoIds,
+  mapQueueItem,
+} from './utils';
 
 import { getDefaultProfile, type Profile, type VideoData } from '../types';
 
@@ -110,6 +115,25 @@ export type QueueOptions = {
 };
 export type QueueEventListener = (event: ConnectionEventUnion) => void;
 
+// one entry per queue item; songs with a music video are wrapped
+const QUEUE_ENTRY_SELECTOR =
+  '#contents > ytmusic-player-queue-item,#contents > ytmusic-playlist-panel-video-wrapper-renderer';
+const QUEUE_ITEM_TAG = 'ytmusic-player-queue-item';
+const OWNER_CLASS = 'music-together-owner';
+const NAME_CLASS = 'music-together-name';
+
+const setAttr = (element: Element, name: string, value: string) => {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+};
+
+const isOwnLabel = (node: Node) =>
+  node instanceof Element &&
+  (node.classList.contains(OWNER_CLASS) || node.classList.contains(NAME_CLASS));
+
+const containsQueueItem = (node: Node) =>
+  node instanceof Element &&
+  (node.matches(QUEUE_ITEM_TAG) || !!node.querySelector(QUEUE_ITEM_TAG));
+
 export class Queue {
   private readonly queue: QueueElement;
 
@@ -124,6 +148,16 @@ export class Queue {
 
   private owner: Profile | null;
   private readonly getProfile: (id: string) => Profile | undefined;
+
+  private ownerObserver?: MutationObserver;
+  private unsubscribeStore?: () => void;
+  private ownerSyncFrame?: number;
+
+  private idCache?: {
+    items: QueueItem[];
+    ids: string[];
+    hash: string | undefined;
+  };
 
   constructor(options: QueueOptions) {
     this.getProfile = options.getProfile;
@@ -157,8 +191,29 @@ export class Queue {
     return mapQueueItem((it) => it, this.rawItems);
   }
 
-  get videoIds() {
-    return this.flatItems.map((it) => it?.videoId ?? '');
+  /**
+   * Video ids in queue order. Cached per store snapshot, because this is read
+   * every second while hosting and walking a long queue each time adds up.
+   */
+  get videoIds(): string[] {
+    const items = this.rawItems;
+    if (!this.idCache || this.idCache.items !== items) {
+      this.idCache = {
+        items,
+        ids: this.flatItems.map((it) => it?.videoId ?? ''),
+        hash: undefined,
+      };
+    }
+    return this.idCache.ids;
+  }
+
+  /** Fingerprint of the queue order, see `hashVideoIds`. */
+  get queueHash() {
+    const ids = this.videoIds;
+    // `videoIds` just refreshed the cache
+    const cache = this.idCache!;
+    cache.hash ??= hashVideoIds(ids);
+    return cache.hash;
   }
 
   /**
@@ -179,12 +234,17 @@ export class Queue {
     return best;
   }
 
-  /** Current queue as shown in the player, with known owners attached. */
+  /**
+   * Current queue as shown in the player, with known owners attached. Owners
+   * follow their songs, not positions, so songs that YouTube Music moved or
+   * added on its own can't take over someone else's owner.
+   */
   getSnapshot(): VideoData[] {
-    return this.videoIds.map((videoId, index) => ({
-      videoId,
-      ownerId: this._videoList[index]?.ownerId ?? this.owner?.id ?? '',
-    }));
+    return alignOwners(
+      this.rawItems.map(getItemVideoIds),
+      this._videoList,
+      this.owner?.id ?? '',
+    );
   }
 
   setOwner(owner: Profile) {
@@ -198,36 +258,46 @@ export class Queue {
     if (sync) await this.syncVideo();
   }
 
-  async addVideos(videos: VideoData[], index?: number) {
+  /**
+   * Adds songs to the queue. With `replace`, they replace the whole queue in
+   * one step, so a queue can never end up mixing two users' picks.
+   */
+  async addVideos(videos: VideoData[], index?: number, replace = false) {
     const response = await getMusicQueueRenderer(
       videos.map((it) => it.videoId),
     );
     if (!response) return false;
 
-    const items = response.queueDatas.map((it) => it?.content).filter(Boolean);
+    const items = response.queueDatas
+      .map((it) => it?.content)
+      .filter(Boolean) as QueueItem[];
     if (!items.length) return false;
 
-    // get_queue may drop unavailable videos, so track what was actually added
-    const addedIds = mapQueueItem(
-      (it) => it?.videoId ?? '',
-      items as QueueItem[],
-    );
+    // get_queue may drop unavailable videos or return another version of a
+    // song (e.g. its music video), so record what was actually added
+    const addedIds = items.map(getItemVideoIds);
     const added: VideoData[] =
       addedIds.length === videos.length
-        ? videos
-        : addedIds.map((videoId) => ({
-            videoId,
-            ownerId:
-              videos.find((it) => it.videoId === videoId)?.ownerId ??
-              this.owner?.id ??
-              '',
-          }));
+        ? addedIds.map((ids, i) => ({
+            videoId: ids[0] ?? videos[i].videoId,
+            ownerId: videos[i].ownerId,
+          }))
+        : alignOwners(
+            addedIds,
+            videos,
+            videos[0]?.ownerId ?? this.owner?.id ?? '',
+          );
+
+    // owners of the songs already there, matched before the queue changes
+    const videoList = replace ? [] : this.getSnapshot();
+
+    this.internalDispatch = true;
+    if (replace) this.queue?.dispatch({ type: 'CLEAR' });
 
     const state = this.queue.queue.store.store.getState();
     const length = state.queue.items.length;
     const insertAt = Math.min(index ?? length, length);
 
-    this.internalDispatch = true;
     this.queue?.dispatch({
       type: 'ADD_ITEMS',
       payload: {
@@ -238,11 +308,8 @@ export class Queue {
         shouldAssignIds: true,
       },
     });
-    this._videoList.splice(
-      Math.min(insertAt, this._videoList.length),
-      0,
-      ...added,
-    );
+    videoList.splice(insertAt, 0, ...added);
+    this._videoList = videoList;
     this.internalDispatch = false;
     setTimeout(() => {
       this.initQueue();
@@ -254,6 +321,7 @@ export class Queue {
 
   removeVideo(index: number) {
     this.internalDispatch = true;
+    this._videoList = this.getSnapshot();
     this._videoList.splice(index, 1);
     this.queue?.dispatch({
       type: 'REMOVE_ITEM',
@@ -292,8 +360,9 @@ export class Queue {
 
   moveItem(fromIndex: number, toIndex: number) {
     this.internalDispatch = true;
-    const data = this._videoList.splice(fromIndex, 1)[0];
-    this._videoList.splice(toIndex, 0, data);
+    this._videoList = this.getSnapshot();
+    const [data] = this._videoList.splice(fromIndex, 1);
+    if (data) this._videoList.splice(toIndex, 0, data);
     this.queue?.dispatch({
       type: 'MOVE_ITEM',
       payload: {
@@ -385,10 +454,12 @@ export class Queue {
 
             if (videoList.length > 0) {
               this.broadcast({
-                // play
+                // play: replaces the queue in one step, even if someone else
+                // started a song at the same time
                 type: 'ADD_SONGS',
                 payload: {
                   videoList,
+                  replace: true,
                 },
                 after: [
                   {
@@ -572,57 +643,111 @@ export class Queue {
   }
 
   syncQueueOwner() {
-    const allQueue = document.querySelectorAll('#queue');
+    const owners = this.getSnapshot();
 
-    allQueue.forEach((queue) => {
-      const list = Array.from(
-        queue?.querySelectorAll<HTMLElement>(
-          '#contents > ytmusic-player-queue-item,#contents > ytmusic-playlist-panel-video-wrapper-renderer > #primary-renderer > ytmusic-player-queue-item',
-        ) ?? [],
-      );
+    document.querySelectorAll('#queue').forEach((queue) => {
+      queue
+        .querySelectorAll<HTMLElement>(QUEUE_ENTRY_SELECTOR)
+        .forEach((entry, index) => {
+          const ownerId = owners[index]?.ownerId;
+          if (ownerId === undefined) return; // not removed from the page yet
 
-      list.forEach((item, index: number | undefined) => {
-        if (typeof index !== 'number') return;
-
-        const id = this._videoList[index]?.ownerId;
-        let data = this.getProfile(id);
-
-        const profile =
-          item.querySelector<HTMLImageElement>('.music-together-owner') ??
-          document.createElement('img');
-        profile.classList.add('music-together-owner');
-        profile.dataset.id = id;
-        profile.dataset.index = index.toString();
-
-        const name =
-          item.querySelector<HTMLElement>('.music-together-name') ??
-          document.createElement('div');
-        name.classList.add('music-together-name');
-        name.textContent =
-          data?.name ?? t('plugins.music-together.internal.unknown-user');
-
-        if (!data?.name && !data?.handleId) {
-          data = getDefaultProfile(data?.id ?? '');
-        }
-
-        if (data) {
-          profile.dataset.thumbnail = data.thumbnail ?? '';
-          profile.dataset.name = data.name ?? '';
-          profile.dataset.handleId = data.handleId ?? '';
-          profile.dataset.id = data.id ?? '';
-
-          profile.src = data.thumbnail ?? '';
-          profile.title = data.name ?? '';
-          profile.alt = data.handleId ?? '';
-        }
-
-        if (!profile.isConnected) item.append(profile);
-        if (!name.isConnected) item.append(name);
-      });
+          // a song with a music video shows either version, label both
+          const items = entry.matches(QUEUE_ITEM_TAG)
+            ? [entry]
+            : Array.from(entry.querySelectorAll<HTMLElement>(QUEUE_ITEM_TAG));
+          items.forEach((item) => this.setItemOwner(item, ownerId, index));
+        });
     });
   }
 
+  /**
+   * Keeps owner labels up to date while a session runs: YouTube Music renders
+   * long queues bit by bit and can change the queue on its own, so labeling
+   * only after our own changes leaves some songs without one.
+   */
+  watchQueueOwner() {
+    this.stopWatchingQueueOwner();
+
+    const scheduleSync = () => {
+      if (this.ownerSyncFrame !== undefined) return;
+      this.ownerSyncFrame = requestAnimationFrame(() => {
+        this.ownerSyncFrame = undefined;
+        this.syncQueueOwner();
+      });
+    };
+
+    this.ownerObserver = new MutationObserver((mutations) => {
+      const rendered = mutations.some((mutation) =>
+        Array.from(mutation.addedNodes).some(
+          (node) => !isOwnLabel(node) && containsQueueItem(node),
+        ),
+      );
+      if (rendered) scheduleSync();
+    });
+    document.querySelectorAll('#queue').forEach((queue) => {
+      this.ownerObserver?.observe(queue, { childList: true, subtree: true });
+    });
+
+    const store = this.queue?.queue.store.store;
+    let lastItems = this.rawItems;
+    const unsubscribe = store?.subscribe(() => {
+      const items = this.rawItems;
+      if (items === lastItems) return;
+      lastItems = items;
+      scheduleSync();
+    });
+    if (typeof unsubscribe === 'function') {
+      this.unsubscribeStore = unsubscribe as () => void;
+    }
+  }
+
+  private stopWatchingQueueOwner() {
+    this.ownerObserver?.disconnect();
+    this.ownerObserver = undefined;
+    this.unsubscribeStore?.();
+    this.unsubscribeStore = undefined;
+    if (this.ownerSyncFrame !== undefined) {
+      cancelAnimationFrame(this.ownerSyncFrame);
+      this.ownerSyncFrame = undefined;
+    }
+  }
+
+  private setItemOwner(item: HTMLElement, ownerId: string, index: number) {
+    let data = this.getProfile(ownerId);
+    const name =
+      data?.name ?? t('plugins.music-together.internal.unknown-user');
+    if (!data?.name && !data?.handleId) {
+      data = getDefaultProfile(data?.id ?? '');
+    }
+
+    const profile =
+      item.querySelector<HTMLImageElement>(`.${OWNER_CLASS}`) ??
+      document.createElement('img');
+    profile.classList.add(OWNER_CLASS);
+    // only touch what changed, labels are refreshed often
+    setAttr(profile, 'data-id', ownerId);
+    setAttr(profile, 'data-index', index.toString());
+    setAttr(profile, 'data-thumbnail', data.thumbnail ?? '');
+    setAttr(profile, 'data-name', data.name ?? '');
+    setAttr(profile, 'data-handle-id', data.handleId ?? '');
+    setAttr(profile, 'src', data.thumbnail ?? '');
+    setAttr(profile, 'title', data.name ?? '');
+    setAttr(profile, 'alt', data.handleId ?? '');
+
+    const label =
+      item.querySelector<HTMLElement>(`.${NAME_CLASS}`) ??
+      document.createElement('div');
+    label.classList.add(NAME_CLASS);
+    if (label.textContent !== name) label.textContent = name;
+
+    if (!profile.isConnected) item.append(profile);
+    if (!label.isConnected) item.append(label);
+  }
+
   removeQueueOwner() {
+    this.stopWatchingQueueOwner();
+
     const allQueue = document.querySelectorAll('#queue');
 
     allQueue.forEach((queue) => {

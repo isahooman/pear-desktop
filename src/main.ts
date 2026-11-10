@@ -44,6 +44,7 @@ import { fileExists, injectCSS, injectCSSAsFile } from '@/plugins/utils/main';
 import { restart, setupAppControls } from '@/providers/app-controls';
 import {
   APP_PROTOCOL,
+  findMusicUrl,
   handleProtocol,
   setupProtocolHandler,
 } from '@/providers/protocol-handler';
@@ -428,9 +429,11 @@ async function createMainWindow() {
     win.setAlwaysOnTop(true);
   }
 
-  const urlToLoad = config.get('options.resumeOnStart')
-    ? config.get('url')
-    : config.defaultConfig.url;
+  const urlToLoad =
+    findMusicUrl(process.argv.slice(1)) ??
+    (config.get('options.resumeOnStart')
+      ? config.get('url')
+      : config.defaultConfig.url);
   win.on('closed', onClosed);
 
   win.on('move', () => {
@@ -788,6 +791,11 @@ app.whenReady().then(async () => {
 
     if (!mainWindow) {
       return;
+    }
+
+    const musicUrl = findMusicUrl(commandLine.slice(1));
+    if (musicUrl) {
+      mainWindow.webContents.loadURL(musicUrl);
     }
 
     if (mainWindow.isMinimized()) {
